@@ -1,0 +1,6 @@
+lr: 0.0003
+d: 384
+bev: 64
+horizon: 12
+weight_decay: 0.01
+grad_clip: 1.0

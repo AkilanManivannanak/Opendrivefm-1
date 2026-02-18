@@ -1,0 +1,6 @@
+lr: 0.0001
+bev: 64
+horizon: 12
+traj_w: 0.05
+dice_w: 0.5
+pos_weight: 5.112824594567705

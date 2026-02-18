@@ -1,0 +1,6 @@
+bev: 64
+d: 384
+horizon: 12
+lr: 0.0003
+w_occ: 1.0
+w_traj: 1.0
