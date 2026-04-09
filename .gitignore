@@ -1,11 +1,27 @@
-.venv/
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# macOS
 .DS_Store
-artifacts/
-reports/
-data/
+
+# Experiment / generated
 outputs/
-dataset/
-wandb/
 lightning_logs/
+
+# Data
+data/
+dataset/
+
+# Checkpoints / archives
+*.ckpt
+*.pt
+*.pth
+*.zip
+
+# Optional
+.env
