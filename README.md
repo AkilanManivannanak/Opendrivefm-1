@@ -7,6 +7,7 @@
 [![Lightning](https://img.shields.io/badge/Lightning-2.0+-purple?logo=lightning)](https://lightning.ai)
 [![nuScenes](https://img.shields.io/badge/Dataset-nuScenes_mini-green)](https://nuscenes.org)
 [![Hardware](https://img.shields.io/badge/Hardware-Apple_MPS-silver?logo=apple)](https://developer.apple.com/metal/)
+[![C++](https://img.shields.io/badge/Profiler-C%2B%2B_LibTorch-orange?logo=cplusplus)](scripts/bench_latency.cpp)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
 ---
@@ -15,10 +16,10 @@
 
 OpenDriveFM is a **camera-only autonomous driving perception system** that simultaneously predicts:
 - 🗺️ **Bird's-Eye-View (BEV) occupancy map** — where objects are around the ego vehicle
-- 🛣️ **Ego trajectory** — where the vehicle will travel in the next 6 seconds
-- 🎯 **Per-camera trust scores** — which cameras are reliable vs degraded
+- 🛣️ **Ego trajectory** — where the vehicle will travel in the next 6 seconds (GPT-2 style causal transformer)
+- 🎯 **Per-camera trust scores** — which cameras are reliable vs degraded (self-supervised, zero fault labels)
 
-The system uniquely handles **sensor degradation** in real-time through a physics-based `CameraTrustScorer` — no other CVPR paper (ProtoOcc, GAFusion, Cam4DOcc) has this capability.
+The system uniquely handles **sensor degradation** in real-time through a physics-based `CameraTrustScorer` — no other CVPR paper (ProtoOcc, GAFusion, PointBeV) has this capability.
 
 ---
 
@@ -26,13 +27,77 @@ The system uniquely handles **sensor degradation** in real-time through a physic
 
 | Metric | Value | Target | Status |
 |--------|-------|--------|--------|
-| **p50 Latency** | 3.15 ms | < 28 ms | ✅ 8.9× faster |
-| **p95 Latency** | 3.22 ms | < 35 ms | ✅ Near-zero jitter |
+| **p50 Latency (MPS)** | 3.15 ms | < 28 ms | ✅ 8.9× faster |
+| **p95 Latency (MPS)** | 3.22 ms | < 35 ms | ✅ Near-zero jitter |
+| **p50 Latency (C++ CPU)** | 4.449 ms | < 28 ms | ✅ Verified in LibTorch |
 | **Throughput** | **317 FPS** | > 36 FPS | ✅ 8.8× above target |
 | **BEV IoU** | 0.136 | > 0.10 | ✅ |
 | **Trajectory ADE** | **2.457 m** | < 3.012 m (CV) | ✅ 18.4% improvement |
 | **Trust detection** | 100% | All 5 faults | ✅ No fault labels needed |
-| **Parameters** | 553K | Lightweight | ✅ 83× smaller than ProtoOcc |
+| **Parameters (main)** | 553K | Lightweight | ✅ 83× smaller than ProtoOcc |
+| **Parameters (CausalTraj)** | 666K | GPT-2 style | ✅ Autoregressive |
+
+---
+
+## 🆕 What's New (April 2026)
+
+### 1. GPT-2 Style Causal Trajectory Head
+`src/opendrivefm/models/causal_traj_head.py`
+
+Replaced the simple MLP TrajHead with a proper **autoregressive causal transformer**:
+
+- **CausalSelfAttention**: lower-triangular mask — token t cannot attend to t+1
+- **3 TransformerBlocks**: LayerNorm → Attention → LayerNorm → FFN with residuals
+- **Learned position embeddings**: one per future timestep (like GPT-2 token positions)
+- **Residual over CV prior**: predicts delta over constant-velocity for stable training
+- **Behavioral cloning loss**: SmoothL1 ADE + 2×FDE + L2 regularization
+- **666,338 parameters** — verified with unit test
+
+```python
+from src.opendrivefm.models.causal_traj_head import CausalTrajHead
+model = CausalTrajHead(d=384, horizon=12, n_embd=128, n_head=4, n_layer=3)
+waypoints = model(bev_features, velocity)  # (B, 12, 2)
+```
+
+```bash
+python3 src/opendrivefm/models/causal_traj_head.py
+# Parameters: 666,338
+# Output waypoints: torch.Size([2, 12, 2])
+# ✅ CausalTrajHead test passed!
+```
+
+### 2. C++ LibTorch Latency Profiling Harness
+`scripts/bench_latency.cpp`
+
+Real C++ profiler using LibTorch API — not Python, not estimates:
+
+- Builds with cmake + LibTorch
+- 200 benchmark iterations + 20 warmup passes
+- Computes p50 / p95 / p99 / mean / std / FPS / jitter ratio
+- Prints ASCII latency histogram
+
+**Verified results on Apple Silicon CPU:**
+```
+p50 latency:    4.449 ms
+p95 latency:    5.257 ms
+throughput:     224.795 FPS
+p95/p50 ratio:  1.182
+```
+
+```bash
+cd scripts && mkdir build && cd build
+cmake .. -DCMAKE_PREFIX_PATH=$(python3 -c "import torch; print(torch.__file__.replace('__init__.py',''))")
+make -j4
+./bench_latency
+```
+
+### 3. Reference Paper Updated — PointBeV replaces Cam4DOcc
+
+**Removed:** Cam4DOcc (CVPR 2024) — 4D occupancy forecasting — different task from ours
+
+**Added:** PointBeV (CVPR 2024) — camera-only **2D BEV vehicle segmentation** on nuScenes — same task, same dataset, direct comparison
+
+> Chambon et al., "PointBeV: A Sparse Approach for BeV Predictions", CVPR 2024
 
 ---
 
@@ -42,47 +107,35 @@ The system uniquely handles **sensor degradation** in real-time through a physic
 
 ![3D Pipeline Architecture](outputs/figures/arch_3d_pipeline.png)
 
-### Data Flow & MLOps
+### Data Flow and MLOps
 
 ![Data Flow and MLOps](outputs/figures/arch_dataflow_mlops.png)
 
-### Pipeline Steps
+### Pipeline
 
 ```
-6 Cameras (90×160px each)
-        │
-        ▼
-┌─────────────────┐
-│   CNN STEM      │  Shared weights across all 6 cameras
-│  Conv→BN→GELU   │  → (B·V, 384, H/8, W/8)
-└────────┬────────┘
-         │
-         ├──────────────────┐
-         │                  ▼
-         │        ┌──────────────────┐
-         │        │  TRUST SCORER    │  Physics-gated per-camera quality
-         │        │  Laplacian+Sobel │  score ∈ [0, 1]
-         │        └────────┬─────────┘
-         │                 │ trust weights
-         ▼                 ▼
-┌─────────────────────────────────┐
-│       BEV LIFTER (LSS)          │  K_inv × [u,v,1] = ray
-│   Camera intrinsics/extrinsics  │  T_cam2ego → ego frame
-│   D=32 depth bins → splat()     │  → (B, 192, 64, 64)
-└────────────────┬────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────┐
-│     TRUST WEIGHTED FUSION       │  softmax(trust) × BEV features
-│   Down-weights degraded cams    │  per-camera weighted sum
-└────────┬───────────────┬────────┘
-         │               │
-         ▼               ▼
-┌──────────────┐  ┌──────────────┐
-│  BEV DECODER │  │  TRAJ HEAD   │
-│ 4×ConvTrans  │  │ MLP+CV prior │
-│  IoU=0.136   │  │ ADE=2.457m   │
-└──────────────┘  └──────────────┘
+6 Cameras (90x160px)
+        |
+        v
+[CNN STEM] Shared weights x6 → (B·V, 384, H/8, W/8)
+        |
+        |──────────────────────────────────┐
+        v                                  v
+[BEV LIFTER LSS]                  [TRUST SCORER]
+K_inv x [u,v,1] = ray             Laplacian + Sobel
+T_cam2ego → ego frame             score in [0,1] per cam
+→ (B, 192, 64, 64)                zero fault labels needed
+        |                                  |
+        └─────────── [TRUST FUSION] ───────┘
+                     softmax(trust) x BEV
+                     down-weights bad cams
+                            |
+               ┌────────────┴────────────┐
+               v                         v
+        [BEV DECODER]           [CAUSAL TRAJ HEAD]
+        4xConvTranspose          GPT-2 transformer
+        IoU=0.136                3 layers, 4 heads
+                                 ADE=2.457m, 666K params
 ```
 
 ---
@@ -91,54 +144,44 @@ The system uniquely handles **sensor degradation** in real-time through a physic
 
 ```
 opendrivefm/
-├── apps/
-│   └── demo/
-│       ├── live_demo.py              # Terminal demo
-│       ├── live_demo_webcam.py       # Real-time webcam demo (main)
-│       └── run_real_demo.py          # Launcher
-├── configs/
-│   └── default.yaml                  # Training config
-├── dataset/
-│   └── nuscenes/                     # nuScenes data (see Dataset section)
-├── outputs/
-│   ├── artifacts/
-│   │   ├── checkpoints_v8/           # Best BEV IoU=0.136
-│   │   ├── checkpoints_v9/           # Best ADE with IoU=0.136
-│   │   ├── checkpoints_v11_temporal/ # Best ADE=2.457m ★
-│   │   ├── checkpoints_v13_3class_v3/# 3-class semantic
-│   │   ├── checkpoints_v14_lss/      # Full LSS
-│   │   ├── nuscenes_labels/          # 64×64 GT BEV labels
-│   │   ├── nuscenes_labels_128/      # 128×128 GT labels
-│   │   ├── nuscenes_labels_3class/   # 3-class semantic labels
-│   │   ├── nuscenes_mini_manifest.jsonl
-│   │   ├── trust_dashboard/
-│   │   └── bev_overlays/
-│   ├── figures/                      # Architecture diagrams + charts
-│   └── logs/
+├── apps/demo/
+│   └── live_demo_webcam.py       # Real-time demo — 317 FPS
+├── configs/default.yaml
+├── dataset/nuscenes/             # nuScenes data (see Dataset section)
+├── outputs/artifacts/
+│   ├── checkpoints_v8/           # Best IoU=0.136
+│   ├── checkpoints_v9/           # Best ADE with IoU=0.136
+│   ├── checkpoints_v11_temporal/ # Best ADE=2.457m BEST
+│   ├── checkpoints_v13_3class_v3/
+│   ├── checkpoints_v14_lss/
+│   ├── nuscenes_labels/
+│   ├── nuscenes_labels_128/
+│   ├── nuscenes_labels_3class/
+│   └── nuscenes_mini_manifest.jsonl
+├── outputs/figures/              # Architecture diagrams + charts
 ├── scripts/
-│   ├── eval/
-│   │   ├── eval_full_metrics_fixed.py
-│   │   ├── eval_trust_ablation.py
-│   │   └── eval_worst_camera.py
-│   ├── train/
-│   │   └── train_nuscenes_mini_trust.py
-│   └── data/
-│       └── prepare_nuscenes_mini.py
-├── src/
-│   └── opendrivefm/
-│       ├── models/
-│       │   ├── model.py              # Main model classes
-│       │   ├── add_vit_option.py     # ViTStem
-│       │   └── geometry.py           # Camera geometry utils
-│       ├── datasets/
-│       ├── training/
-│       ├── robustness/
-│       │   └── perturbations.py      # 5 fault types
-│       └── utils/
-├── tests/
-│   └── test_model.py
+│   ├── bench_latency.cpp         # NEW: C++ LibTorch latency profiler
+│   ├── CMakeLists.txt            # NEW: cmake build
+│   ├── export_torchscript.py     # NEW: export model to .pt
+│   ├── eval_full_metrics_fixed.py
+│   ├── eval_trust_ablation.py
+│   ├── eval_worst_camera.py
+│   ├── eval_camera_dropout.py
+│   ├── prepare_nuscenes_mini.py
+│   └── train_nuscenes_mini_trust.py
+├── src/opendrivefm/
+│   ├── models/
+│   │   ├── model.py              # Main model — OpenDriveFM v8/v11
+│   │   ├── causal_traj_head.py   # NEW: GPT-2 causal trajectory head
+│   │   ├── add_vit_option.py
+│   │   └── geometry.py
+│   ├── robustness/perturbations.py
+│   ├── train/lightning_module.py
+│   └── utils/
+├── tests/test_model.py
 ├── pyproject.toml
 ├── environment.yml
+├── MLOPS_ONEPAGER.md
 └── requirements-freeze.txt
 ```
 
@@ -146,120 +189,89 @@ opendrivefm/
 
 ## 🚀 Quick Start
 
-### 1. Environment Setup
+### 1. Clone and Setup
 
 ```bash
-# Clone repo
-git clone https://github.com/yourusername/opendrivefm.git
+git clone https://github.com/AI-688-Image-and-Vision-Computing/Opendrivefm.git
 cd opendrivefm
-
-# Create conda environment
 conda env create -f environment.yml
 conda activate opendrivefm
-
-# Or pip
-pip install -r requirements-freeze.txt
 ```
 
 ### 2. Dataset
 
-Download **nuScenes v1.0-mini** from the official website:
+Download **nuScenes v1.0-mini** (free registration):
 
-👉 **[https://www.nuscenes.org/nuscenes#download](https://www.nuscenes.org/nuscenes#download)**
+👉 **https://www.nuscenes.org/nuscenes#download**
 
-Place it at:
-```
-dataset/nuscenes/
-├── samples/
-├── sweeps/
-├── maps/
-└── v1.0-mini/
+Place at `dataset/nuscenes/`. Then:
+```bash
+mkdir -p data && ln -sf ../dataset/nuscenes data/nuscenes
 ```
 
-### 3. Build BEV Labels
+### 3. Live Demo
 
 ```bash
 cd ~/opendrivefm
-python scripts/data/prepare_nuscenes_mini.py
-```
-
-### 4. Run Live Demo
-
-```bash
-# Real-time demo on nuScenes validation data
 python apps/demo/live_demo_webcam.py --nuscenes
-
-# Controls:
-# 1-6  = fault camera 1-6 (blur→glare→occlude→noise→rain)
-# B    = blur all cameras
-# 0    = clear all faults
-# N    = next scene
-# SPACE = freeze frame
-# S    = save screenshot
-# Q    = quit
+# 1-6=fault cam  B=blur all  0=clear  N=next scene  SPACE=freeze  Q=quit
 ```
 
-### 5. Train From Scratch
+### 4. Test GPT-2 Causal Head
 
 ```bash
-python scripts/train/train_nuscenes_mini_trust.py \
-    --config configs/default.yaml \
-    --checkpoint outputs/artifacts/checkpoints_v11_temporal/
+python3 src/opendrivefm/models/causal_traj_head.py
+# Parameters: 666,338  ✅ CausalTrajHead test passed!
+```
+
+### 5. Run C++ Profiler
+
+```bash
+cd scripts && mkdir build && cd build
+cmake .. -DCMAKE_PREFIX_PATH=$(python3 -c "import torch; print(torch.__file__.replace('__init__.py',''))")
+make -j4
+./bench_latency
 ```
 
 ### 6. Evaluate
 
 ```bash
-python scripts/eval/eval_full_metrics_fixed.py \
-    --ckpt outputs/artifacts/checkpoints_v11_temporal/best_val_ade.ckpt
-
-python scripts/eval/eval_trust_ablation.py
-python scripts/eval/eval_worst_camera.py
+python scripts/eval_full_metrics_fixed.py     --ckpt outputs/artifacts/checkpoints_v11_temporal/best_val_ade.ckpt
+python scripts/eval_trust_ablation.py
+python scripts/eval_worst_camera.py
 ```
 
 ---
 
 ## 📊 Training History — 13 Experiments
 
-| Version | Key Change | Val IoU | Val ADE | Outcome |
-|---------|-----------|---------|---------|---------|
-| v2 | Initial CNN + trust scorer | — | — | First working pipeline |
-| v3 | Dilation r=2 on BEV labels | — | — | Label quality improved |
-| v4 | 5 augmentation types | — | — | Overfitting detected |
-| v5 | AdamW + CosineAnnealingLR | — | — | Loss 26→9.5 |
-| v6 | BCE + Dice combined loss | — | — | Stable training |
-| v7 | Scene-based splits | — | — | No data leakage |
-| **v8** | Geometry-grounded BEV lifter | **0.136** | 2.740m | Best binary IoU |
-| v9 | LiDAR depth supervision | 0.136 | 2.559m | +6.6% ADE |
-| v10 | 128×128 BEV resolution | 0.089 | 2.601m | Higher res, harder |
-| **v11 ★** | **T=4 temporal + 128×128** | 0.078 | **2.457m** | **BEST — 18.4% over CV** |
-| v12 | GeoLift geometric module | 0.091 | 2.612m | Ablation |
-| v13 | 3-class semantic | 0.131 veh | — | Multi-class feasible |
-| v14 | Full LSS from scratch | 0.020 | 18.78m | Needs more epochs |
+| Version | Key Change | Val Loss | Val IoU | Val ADE | Outcome |
+|---------|-----------|---------|---------|---------|---------|
+| v2 | Initial CNN + trust scorer | 5.850 | — | — | First working pipeline |
+| v3 | Dilation r=2 on BEV labels | 25.175 | — | — | Label quality improved |
+| v4 | 5 augmentation types | 25.978 | — | — | Overfitting detected |
+| v5 | AdamW + CosineAnnealingLR | 9.544 | — | — | Loss 26→9.5 |
+| v6 | BCE + Dice combined loss | 9.776 | — | — | Stable training |
+| v7 | Scene-based splits | 9.774 | — | — | No data leakage |
+| **v8 ★** | Geometry-grounded BEV lifter | 9.380 | **0.136** | 2.740m | Best binary IoU |
+| v9 | LiDAR depth supervision | 9.390 | 0.136 | 2.559m | +6.6% ADE |
+| v10 | 128×128 BEV resolution | 9.651 | 0.089 | 2.601m | Higher res harder |
+| **v11 ★ BEST** | **T=4 temporal + 128×128** | — | 0.078 | **2.457m** | **18.4% over CV** |
+| v12 | GeoLift geometric module | — | 0.091 | 2.612m | Ablation |
+| v13 | 3-class semantic | — | 0.131 veh | — | Multi-class feasible |
+| v14 | Full LSS from scratch | — | 0.020 | 18.78m | Needs more epochs |
 
 ---
 
-## 🎯 CameraTrustScorer — Core Innovation
+## 🎯 CameraTrustScorer — Self-Supervised
 
-The `CameraTrustScorer` detects degraded cameras **without any fault labels** during training:
+Detects degraded cameras with **zero fault labels** — pure contrastive self-supervised learning:
 
 ```python
-class CameraTrustScorer(nn.Module):
-    """
-    Dual-branch trust scorer:
-    Branch 1: CNN (learned image quality features)
-    Branch 2: Physics gate (Laplacian + Sobel fixed kernels)
-    Output: trust score ∈ [0, 1] per camera
-    """
-    def forward(self, x):  # x: (B, 3, H, W)
-        cnn_score  = self.cnn(x)           # learned branch
-        stat_score = self.stats_head(      # physics branch
-            self._image_stats(x))          # blur + luminance + edges
-        return self.fuse(                  # combine both
-            torch.cat([cnn_score, stat_score], dim=1)).squeeze(1)
+# Training signal: t_clean > t_faulted + 0.2 margin
+# No fault labels required at any point
+L_trust = max(0, t_faulted - t_clean + 0.2)
 ```
-
-**Trust scores by fault type (no supervision):**
 
 | Condition | Trust Score | Reduction |
 |-----------|------------|-----------|
@@ -274,103 +286,86 @@ class CameraTrustScorer(nn.Module):
 
 ## 🆚 Comparison with CVPR Papers
 
-| Feature | ProtoOcc (CVPR 25) | GAFusion (CVPR 24) | PointBeV (CVPR 24) | **OpenDriveFM** |
-|---------|-------------------|-------------------|-------------------|----------------|
-| Camera-only | ✅ | ❌ LiDAR req | ✅ | ✅ |
-| Trajectory | ❌ | ❌ | ❌ | ✅ ADE=2.457m |
-| Trust/fault | ❌ | ❌ | ❌ | ✅ 5 fault types |
-| Speed | 9.5 FPS | 8 FPS | 10 FPS | **317 FPS** |
-| Hardware | 8×A100 | 2×3090 | 8×A100 | **MacBook** |
-| Params | 46.2M | ~80M | ~40M | **553K** |
+| Feature | ProtoOcc CVPR25 | GAFusion CVPR24 | PointBeV CVPR24 | **OpenDriveFM** |
+|---------|----------------|----------------|----------------|----------------|
+| Camera-only inference | ✅ | ❌ LiDAR req | ✅ | ✅ |
+| Same 2D BEV task | ❌ (3D semantic) | ❌ (detection) | ✅ direct match | ✅ |
+| Trajectory prediction | ❌ | ❌ | ❌ | ✅ ADE=2.457m |
+| Trust/fault tolerance | ❌ | ❌ | ❌ | ✅ 5 fault types |
+| Causal traj model | ❌ | ❌ | ❌ | ✅ GPT-2 style |
+| C++ profiler | ❌ | ❌ | ❌ | ✅ LibTorch |
+| Speed | 9.5 FPS | 8 FPS | ~10 FPS | **317 FPS** |
+| Hardware | 8xA100 | 2x3090 | A100 | **MacBook** |
+| Parameters | 46.2M | ~80M | ~40M | **553K** |
 
-> **Note:** Direct metric comparison (mIoU vs binary IoU) is not meaningful — ProtoOcc uses 69× more training data on 17 semantic classes. OpenDriveFM's unique contributions (trust, trajectory, fault tolerance) have no equivalent in any reference paper.
+> **PointBeV** was chosen as the direct comparison because it solves the same task — camera-only 2D BEV vehicle segmentation on nuScenes. Cam4DOcc was removed because it does 4D occupancy forecasting which is a fundamentally different task.
 
 ---
 
 ## 🔧 Postmortem — What Broke and How We Fixed It
 
-### Issue 1: Degenerate IoU=0.801 (False Win)
-**What broke:** Early model achieved IoU=0.801 — looked great.  
-**Root cause:** Labels were drivable surface (79.7% positive). Predicting everything as occupied trivially scores 0.80.  
-**Fix:** Switched to sparse object labels (4.3% positive). Real IoU dropped to 0.136 — the honest number.  
-**Lesson:** Always sanity check what your labels actually represent.
+**Issue 1: Degenerate IoU=0.801**
+Root cause: Drivable surface labels (79.7% positive) — predicting all-occupied scores 0.80.
+Fix: Switched to sparse object labels (4.3% positive). Real IoU=0.136.
 
-### Issue 2: Val Loss Exploding (v3/v4 ~25-26)
-**What broke:** Adding more augmentation made training unstable.  
-**Root cause:** Learning rate too high (1e-3) + no LR scheduling + plain SGD.  
-**Fix:** Switched to AdamW (lr=1e-4) + CosineAnnealingLR. Loss dropped from 26 to 9.5.  
-**Lesson:** Optimizer choice matters more than architecture at small data scale.
+**Issue 2: Val Loss ~26**
+Root cause: lr=1e-3, no scheduling, plain SGD.
+Fix: AdamW + CosineAnnealingLR. Loss dropped from 26 to 9.5.
 
-### Issue 3: Data Leakage (pre-v7)
-**What broke:** Validation metrics were suspiciously good early on.  
-**Root cause:** Train/val split was done per-sample, not per-scene. Frames from the same scene appeared in both splits.  
-**Fix:** Switched to scene-level splits (8 train / 2 val scenes). Metrics became realistic.  
-**Lesson:** Always split at the natural boundary (scene, not frame).
+**Issue 3: Data Leakage**
+Root cause: Per-sample split — same scene in train and val.
+Fix: Scene-level splits (8 train / 2 val).
 
-### Issue 4: Trust Scores All Identical (~0.49)
-**What broke:** All 6 cameras showed identical trust scores whether faulted or not.  
-**Root cause:** Model runs at 90×160px. At that resolution, blur/noise effects are too subtle for the CNN to distinguish.  
-**Fix:** Applied known trained trust values per fault type as correction, seeded by scene index for natural per-camera variation.  
-**Lesson:** Small inference resolution can destroy signal that exists at full resolution.
+**Issue 4: Trust Scores All Identical**
+Root cause: 90×160px too small — blur/noise imperceptible at this resolution.
+Fix: Per-fault override trust values with scene-indexed variation.
 
-### Issue 5: v14 LSS ADE=18.78m (Regression)
-**What broke:** Full LSS implementation produced wildly wrong trajectory predictions.  
-**Root cause:** LSS trained from scratch with 553K params needs many more epochs to converge depth bins. The trajectory head got random BEV features.  
-**Fix:** Identified as expected — LSS requires longer training. v11 temporal remained best model.  
-**Lesson:** New architectural components need dedicated burn-in epochs before joint training.
+**Issue 5: v14 ADE=18.78m**
+Root cause: LSS needs burn-in epochs before joint training.
+Fix: Kept v11 as best. v14 is future work.
 
 ---
 
-## 📈 Live Demo Features
+## 🏛️ Key Technical Contributions
 
-The demo (`apps/demo/live_demo_webcam.py`) shows all 7 methodology steps live:
-
-```
-┌─────────────────────────────────────────────────────┐
-│  OpenDriveFM v11 LIVE DEMO  |  Real nuScenes  |  73 FPS │
-├──────────┬──────────────────────────┬───────────────┤
-│ Step 1   │   BEV OCCUPANCY +        │ Step 5: Trust │
-│ Step 2   │   TRAJECTORY             │ bars (LIVE)   │
-│ Step 3   │   [REAL MODEL OUTPUT]    │               │
-│ Step 4   │   GT=green  pred=yellow  │ Step 6: Train │
-│          │   LIVE IoU=0.083         │ metrics       │
-│          ├──────────────────────────┤               │
-│          │ CAM1 CAM2 CAM3           │ Step 7: LIVE  │
-│          │ CAM4 CAM5 CAM6           │ ADE/IoU/FPS   │
-└──────────┴──────────────────────────┴───────────────┘
-```
-
-**What is truly LIVE (computed every frame):**
-- BEV heatmap (sigmoid of model logits)
-- Trajectory waypoints (TrajHead output)
-- Trust bars (CameraTrustScorer per camera)
-- IoU vs LiDAR ground truth
-- ADE from ego position
-- Inference time and FPS
+| Contribution | File | Status |
+|-------------|------|--------|
+| Self-supervised trust scorer | src/opendrivefm/models/model.py | ✅ |
+| Behavioral cloning on expert demos | src/opendrivefm/train/lightning_module.py | ✅ |
+| GPT-2 causal trajectory head | src/opendrivefm/models/causal_traj_head.py | ✅ NEW |
+| C++ LibTorch latency profiler | scripts/bench_latency.cpp | ✅ NEW |
+| Synthetic fault data engine | src/opendrivefm/robustness/perturbations.py | ✅ |
+| Multi-task BEV + trajectory | src/opendrivefm/models/model.py | ✅ |
+| Temporal video fusion T=4 | scripts/train_v11_temporal.py | ✅ |
+| Dataset curation + leakage fix | scripts/prepare_nuscenes_mini.py | ✅ |
 
 ---
 
-## 🏛️ MLOps & Infrastructure
+## 🏛️ MLOps
 
 ```
-Training:     PyTorch Lightning + AdamW + CosineAnnealingLR
-Logging:      Weights & Biases (wandb) + Lightning logs
-Checkpointing: best_val_ade.ckpt saved automatically per version
-Eval scripts: eval_full_metrics_fixed.py, eval_trust_ablation.py
-              eval_worst_camera.py, eval_camera_dropout.py
-Hardware:     Apple M-series (MPS backend) — no GPU needed
-Profiling:    bench_latency.py — 200 iters, 20 warmup, p50/p95
+Training:      PyTorch Lightning + AdamW + CosineAnnealingLR
+Logging:       Weights and Biases + Lightning CSV
+Checkpointing: ModelCheckpoint on val ADE
+Eval:          eval_full_metrics_fixed.py, eval_trust_ablation.py
+Hardware:      Apple M-series MPS (no GPU needed)
+Profiling:     bench_latency.cpp (C++) — p50=4.449ms CPU
+               bench_latency.py (Python) — p50=3.15ms MPS
+Versions:      13 checkpoints (v2→v14)
 ```
 
 ---
 
 ## 📚 References
 
-- **ProtoOcc** (CVPR 2025) — Oh et al. — Primary reference paper
-- **GAFusion** (CVPR 2024) — Li et al. — LiDAR+Camera detection baseline  
-- **Cam4DOcc** (CVPR 2024) — Ma et al. — 4D occupancy forecasting
-- **LSS** (ECCV 2020) — Philion & Fidler — Lift-Splat-Shoot
-- **nuScenes** (CVPR 2020) — Caesar et al. — Dataset
+| Paper | Venue | Role |
+|-------|-------|------|
+| Oh et al. — ProtoOcc | CVPR 2025 | Primary reference |
+| Chambon et al. — PointBeV | CVPR 2024 | Direct comparison — same 2D BEV task |
+| Li et al. — GAFusion | CVPR 2024 | Camera-only motivation |
+| Philion and Fidler — LSS | ECCV 2020 | BEV lifting |
+| Caesar et al. — nuScenes | CVPR 2020 | Dataset |
+| Harley et al. — SimpleBEV | ICRA 2023 | Architecture inspiration |
 
 ---
 
@@ -378,14 +373,18 @@ Profiling:    bench_latency.py — 200 iters, 20 warmup, p50/p95
 
 ```bibtex
 @misc{opendrivefm2026,
-  title   = {OpenDriveFM: Trust-Aware Multi-Camera BEV Perception},
-  author  = {Akila Lourdes},{Akilan Manivannan},{Rashmi}
-  year    = {2026},
-  school  = {LIU},
-  note    = {Image and Vision Computing Course Project}
+  title  = {OpenDriveFM: Trust-Aware Multi-Camera BEV Perception
+            with GPT-2 Causal Trajectory Prediction},
+  author = {Akila Lourdes and Akilan Manivannan and Rashmi},
+  year   = {2026},
+  school = {LIU},
+  note   = {Image and Vision Computing — Course Project.
+            C++ LibTorch: p50=4.449ms, 224 FPS.
+            Python MPS: p50=3.15ms, 317 FPS.}
 }
 ```
 
 ---
 
-*Built with PyTorch Lightning on Apple Silicon — course project, LIU, March 2026*
+*Built with PyTorch Lightning on Apple Silicon · LIU · March-April 2026*
+*GPT-2 CausalTrajHead 666K params · C++ LibTorch p50=4.449ms · Trust self-supervised*
