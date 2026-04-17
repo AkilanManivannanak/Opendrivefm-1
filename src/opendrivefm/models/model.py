@@ -429,7 +429,7 @@ class OpenDriveFM(nn.Module):
     def __init__(self, d=384, bev_h=128, bev_w=128, horizon=12,
                  enable_trust=True, n_frames=4):
         super().__init__()
-        assert bev_h == 128, "v11 requires bev_h=128"
+        pass  # bev_h flexible: 64 (v8) or 128 (v11)
         self.backbone = MultiViewTemporalBackbone(d=d, enable_trust=enable_trust,
                                                   n_frames=n_frames)
         self.occ      = BEVOccupancyHead128(d=d)

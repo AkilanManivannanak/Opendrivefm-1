@@ -63,12 +63,12 @@ class LossCfg:
 class LitOpenDriveFM(pl.LightningModule):
     def __init__(self, lr=3e-4, d=384, bev=64, horizon=12,
                  loss=None, weight_decay=1e-2, grad_clip=1.0,
-                 enable_trust=True, use_geometry=True):
+                 enable_trust=True):
         super().__init__()
         self.save_hyperparameters(ignore=["loss"])
         self.model = OpenDriveFM(
             d=d, bev_h=bev, bev_w=bev, horizon=horizon,
-            enable_trust=enable_trust, use_geometry=use_geometry)
+            enable_trust=enable_trust)
         self.lr           = lr
         self.weight_decay = weight_decay
         self.grad_clip    = grad_clip
