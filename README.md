@@ -1,6 +1,4 @@
-# OpenDriveFM 🚗
-
-> **Trust-Aware Multi-Camera BEV Occupancy Prediction with Ego Trajectory Estimation**
+<img src="https://capsule-render.vercel.app/api?type=waving&color=0:0f2027,50:203a43,100:2c5364&height=120&section=footer&animation=fadeIn" width="100%"/>
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)](https://python.org)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red?logo=pytorch)](https://pytorch.org)
@@ -465,3 +463,6 @@ Versions:      13 checkpoints v2 to v14
 
 317 FPS · ADE=2.457m · IoU=0.136 · Self-supervised trust · GPT-2 trajectory · ViT option · DDP-ready
 Built with PyTorch Lightning on Apple Silicon · LIU Image and Vision Computing · April 2026
+
+---
+<img src="https://capsule-render.vercel.app/api?type=waving&color=0:0f2027,50:203a43,100:2c5364&height=120&section=footer&animation=fadeIn" width="100%"/>
